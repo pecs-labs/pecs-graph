@@ -1,0 +1,18 @@
+[package]
+name = "pecs-graph"
+version = "0.1.0"
+edition = "2024"
+description = "A bounded, checkpointable workflow executor for Rust"
+repository = "https://github.com/pecs-labs/pecs-graph"
+readme = "README.md"
+
+[dependencies]
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio-util = "0.7"
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "test-util"] }

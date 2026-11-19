@@ -1,0 +1,176 @@
+use std::{cell::RefCell, convert::Infallible, future, num::NonZeroUsize, time::Duration};
+
+use pecs_graph::{CancellationToken, Checkpoint, Position, RunError, RunLimits, RunOutcome};
+
+fn limits(max_steps: usize) -> RunLimits {
+    RunLimits {
+        max_steps: NonZeroUsize::new(max_steps).unwrap(),
+        timeout: Duration::from_secs(1),
+    }
+}
+
+#[tokio::test]
+async fn resumes_a_serialized_pause_and_preserves_the_step_count() {
+    let saved = RefCell::new(Vec::new());
+    let cancel = CancellationToken::new();
+    let outcome = pecs_graph::run(
+        &mut Checkpoint::new(0),
+        limits(2),
+        &cancel,
+        |step| async move {
+            assert_eq!(step, 0);
+            Ok::<_, Infallible>(Position::Paused(1))
+        },
+        |checkpoint| future::ready(serde_json::to_writer(&mut *saved.borrow_mut(), &checkpoint)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, RunOutcome::Paused);
+
+    let paused: Checkpoint<u8> = serde_json::from_slice(&saved.into_inner()).unwrap();
+    assert_eq!(paused.position(), &Position::Paused(1));
+    assert_eq!(paused.completed_steps(), 1);
+
+    let mut resumed = paused.resume();
+    let outcome = pecs_graph::run(
+        &mut resumed,
+        limits(2),
+        &cancel,
+        |step| async move {
+            assert_eq!(step, 1);
+            Ok::<_, Infallible>(Position::Completed)
+        },
+        |_| future::ready(Ok::<_, Infallible>(())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, RunOutcome::Completed);
+    assert_eq!(resumed.completed_steps(), 2);
+}
+
+#[tokio::test]
+async fn failed_commit_keeps_the_last_acknowledged_position() {
+    let mut checkpoint = Checkpoint::new(0);
+    let result = pecs_graph::run(
+        &mut checkpoint,
+        limits(4),
+        &CancellationToken::new(),
+        |step| future::ready(Ok::<_, Infallible>(Position::Ready(step + 1))),
+        |checkpoint| {
+            future::ready(if checkpoint.completed_steps() == 2 {
+                Err("store unavailable")
+            } else {
+                Ok(())
+            })
+        },
+    )
+    .await;
+    assert!(matches!(result, Err(RunError::Commit("store unavailable"))));
+    assert_eq!(checkpoint.position(), &Position::Ready(1));
+    assert_eq!(checkpoint.completed_steps(), 1);
+}
+
+#[tokio::test]
+async fn immediate_loop_stops_at_step_limit() {
+    let mut checkpoint = Checkpoint::new(());
+    let result = pecs_graph::run(
+        &mut checkpoint,
+        limits(3),
+        &CancellationToken::new(),
+        |_| future::ready(Ok::<_, Infallible>(Position::Ready(()))),
+        |_| future::ready(Ok::<_, Infallible>(())),
+    )
+    .await;
+    assert!(matches!(result, Err(RunError::StepLimitReached)));
+    assert_eq!(checkpoint.completed_steps(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_leaves_the_interrupted_step_pending() {
+    let mut checkpoint = Checkpoint::new(());
+    let result = pecs_graph::run(
+        &mut checkpoint,
+        limits(3),
+        &CancellationToken::new(),
+        |_| future::pending::<Result<Position<()>, Infallible>>(),
+        |_| future::ready(Ok::<_, Infallible>(())),
+    )
+    .await;
+    assert!(matches!(result, Err(RunError::TimedOut)));
+    assert_eq!(checkpoint.completed_steps(), 0);
+}
+
+#[tokio::test]
+async fn cancellation_prevents_a_step_from_committing() {
+    let cancel = CancellationToken::new();
+    let mut checkpoint = Checkpoint::new(());
+    let result = pecs_graph::run(
+        &mut checkpoint,
+        limits(3),
+        &cancel,
+        |_| {
+            cancel.cancel();
+            future::ready(Ok::<_, Infallible>(Position::Completed))
+        },
+        |_| -> future::Ready<Result<(), Infallible>> { panic!("cancelled step must not commit") },
+    )
+    .await;
+    assert!(matches!(result, Err(RunError::Cancelled)));
+    assert_eq!(checkpoint.completed_steps(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reloaded_batch_only_executes_uncommitted_items() {
+    let committed = RefCell::new(Vec::new());
+    let limit = NonZeroUsize::new(2).unwrap();
+    let mut checkpoint = Checkpoint::new(vec![1, 2, 3]);
+    let saved_cursor = serde_json::to_vec(&checkpoint).unwrap();
+    let cancel = CancellationToken::new();
+    let first_run = pecs_graph::run(
+        &mut checkpoint,
+        limits(3),
+        &cancel,
+        |items| async {
+            pecs_graph::run_batch(items, limit, |item| {
+                let committed = &committed;
+                async move {
+                    if item == 3 {
+                        future::pending::<()>().await;
+                    }
+                    committed.borrow_mut().push(item);
+                    Ok::<_, Infallible>(())
+                }
+            })
+            .await?;
+            Ok::<_, Infallible>(Position::Completed)
+        },
+        |_| future::ready(Ok::<_, Infallible>(())),
+    )
+    .await;
+    assert!(matches!(first_run, Err(RunError::TimedOut)));
+    assert_eq!(*committed.borrow(), [1, 2]);
+
+    let saved_results = serde_json::to_vec(&committed.into_inner()).unwrap();
+    let committed: Vec<u8> = serde_json::from_slice(&saved_results).unwrap();
+    let executed = RefCell::new(Vec::new());
+    let mut restored: Checkpoint<Vec<u8>> = serde_json::from_slice(&saved_cursor).unwrap();
+    let outcome = pecs_graph::run(
+        &mut restored,
+        limits(3),
+        &cancel,
+        |items| async {
+            let pending = items.into_iter().filter(|id| !committed.contains(id));
+            pecs_graph::run_batch(pending, limit, |item| {
+                executed.borrow_mut().push(item);
+                future::ready(Ok::<_, Infallible>(()))
+            })
+            .await?;
+            Ok::<_, Infallible>(Position::Completed)
+        },
+        |_| future::ready(Ok::<_, Infallible>(())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, RunOutcome::Completed);
+    assert_eq!(executed.into_inner(), [3]);
+}
