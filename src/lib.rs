@@ -221,6 +221,65 @@ pub enum RunError<E, C> {
     Commit(C),
 }
 
+/// A workflow error when checkpoints are discarded or infallible.
+pub type SimpleRunError<E> = RunError<E, Infallible>;
+
+/// A workflow definition whose steps and checkpoint commits can be driven by [`run_workflow`].
+pub trait Workflow<S> {
+    /// Failure returned by step execution or checkpoint commit.
+    type Error;
+
+    /// Execute the current step and return the next position.
+    fn step(&self, state: S) -> impl Future<Output = Result<Position<S>, Self::Error>>;
+
+    /// Acknowledge or persist a checkpoint before advancing. Defaults to a no-op.
+    fn commit(
+        &self,
+        _checkpoint: &Checkpoint<S>,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        async { Ok(()) }
+    }
+}
+
+/// Run a workflow until completion, pause, or error using the [`Workflow`] trait.
+///
+/// Each transition is committed via [`Workflow::commit`] before the next step starts.
+pub async fn run_workflow<S, W>(
+    checkpoint: &mut Checkpoint<S>,
+    limits: RunLimits,
+    cancel: &CancellationToken,
+    workflow: &W,
+) -> Result<RunOutcome, RunError<W::Error, W::Error>>
+where
+    S: Clone,
+    W: Workflow<S>,
+{
+    run_with_checkpoints(
+        checkpoint,
+        limits,
+        cancel,
+        |state| workflow.step(state),
+        WorkflowWriter(workflow),
+    )
+    .await
+}
+
+struct WorkflowWriter<'a, W>(&'a W);
+
+impl<S, W> CheckpointWriter<S> for WorkflowWriter<'_, W>
+where
+    W: Workflow<S>,
+{
+    type Error = W::Error;
+
+    fn write(
+        &mut self,
+        checkpoint: &Checkpoint<S>,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        self.0.commit(checkpoint)
+    }
+}
+
 /// Run until completion, pause, or error. Each transition is committed before
 /// the next step starts. A failed commit leaves the supplied cursor at its last
 /// acknowledged position.
@@ -304,6 +363,10 @@ where
     Writer: CheckpointWriter<S>,
 {
     let started = tokio::time::Instant::now();
+    // Defense-in-depth for timeouts and cooperative cancellation:
+    // 1. Synchronous deadline and cancel checks before & after `step` prevent committing
+    //    an expired transition or dispatching next work after time/token budget is exhausted.
+    // 2. The outer `tokio::select!` with `timeout` forces interruption if a step future hangs.
     let execution = async {
         loop {
             let state = match &checkpoint.position {

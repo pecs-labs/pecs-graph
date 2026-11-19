@@ -1,6 +1,6 @@
 # pecs-graph
 
-[简体中文](README.md)
+[简体中文](README.md) · [Developer Guide](GUIDE.md)
 
 `pecs-graph` runs async Rust workflows with typed step transitions. A step can select
 another step, pause with a continuation, or complete. Callers provide workflow

@@ -1,6 +1,6 @@
 # pecs-graph
 
-[English](README.en.md)
+[English](README.en.md) · [新业务快速接入指南](GUIDE.md)
 
 `pecs-graph` 是一个异步 Rust 工作流执行库。每个步骤可以通过强类型状态指定下一步、暂停并保存继续位置，或结束工作流。调用方提供业务逻辑，并决定如何存储检查点和执行结果。
 

@@ -228,3 +228,54 @@ async fn a_reloaded_batch_only_executes_uncommitted_items() {
     assert_eq!(outcome, RunOutcome::Completed);
     assert_eq!(executed.into_inner(), [3]);
 }
+
+struct TestWorkflow {
+    commits: RefCell<Vec<Position<u32>>>,
+}
+
+impl pecs_graph::Workflow<u32> for TestWorkflow {
+    type Error = Infallible;
+
+    async fn step(&self, state: u32) -> Result<Position<u32>, Self::Error> {
+        Ok(if state < 3 {
+            Position::Ready(state + 1)
+        } else {
+            Position::Completed
+        })
+    }
+
+    async fn commit(&self, checkpoint: &Checkpoint<u32>) -> Result<(), Self::Error> {
+        self.commits.borrow_mut().push(checkpoint.position().clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn run_workflow_drives_trait_implementation() {
+    let workflow = TestWorkflow {
+        commits: RefCell::new(Vec::new()),
+    };
+    let mut checkpoint = Checkpoint::new(0u32);
+    let cancel = CancellationToken::new();
+
+    let outcome = pecs_graph::run_workflow(
+        &mut checkpoint,
+        limits(5),
+        &cancel,
+        &workflow,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, RunOutcome::Completed);
+    assert_eq!(checkpoint.completed_steps(), 4);
+    assert_eq!(
+        *workflow.commits.borrow(),
+        vec![
+            Position::Ready(1),
+            Position::Ready(2),
+            Position::Ready(3),
+            Position::Completed,
+        ]
+    );
+}
