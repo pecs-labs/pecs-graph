@@ -119,6 +119,60 @@ async fn cancellation_prevents_a_step_from_committing() {
     assert_eq!(checkpoint.completed_steps(), 0);
 }
 
+#[tokio::test]
+async fn elapsed_deadline_blocks_commit_after_a_blocking_step() {
+    let mut checkpoint = Checkpoint::new(());
+    let result = pecs_graph::run(
+        &mut checkpoint,
+        RunLimits {
+            timeout: Duration::from_millis(10),
+            ..limits(1)
+        },
+        &CancellationToken::new(),
+        |_| {
+            std::thread::sleep(Duration::from_millis(20));
+            future::ready(Ok::<_, Infallible>(Position::Completed))
+        },
+        |_| -> future::Ready<Result<(), Infallible>> {
+            panic!("an expired step must not begin a commit")
+        },
+    )
+    .await;
+    assert!(matches!(result, Err(RunError::TimedOut)));
+    assert_eq!(checkpoint.completed_steps(), 0);
+}
+
+#[tokio::test]
+async fn ready_batch_yields_to_workflow_cancellation() {
+    tokio::spawn(async {
+        let cancel = CancellationToken::new();
+        let result = pecs_graph::run(
+            &mut Checkpoint::new(()),
+            limits(1),
+            &cancel,
+            |_| async {
+                pecs_graph::run_batch(0..10_000, NonZeroUsize::MIN, |item| {
+                    if item == 0 {
+                        cancel.cancel();
+                    }
+                    assert!(item < 9_999, "the batch should yield before finishing");
+                    future::ready(Ok::<_, Infallible>(()))
+                })
+                .await?;
+                Ok(Position::Completed)
+            },
+            |_| future::ready(Ok::<_, Infallible>(())),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(RunError::<Infallible, Infallible>::Cancelled)
+        ));
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_reloaded_batch_only_executes_uncommitted_items() {
     let committed = RefCell::new(Vec::new());
