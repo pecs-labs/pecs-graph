@@ -4,30 +4,28 @@
 
 ---
 
-## 核心设计：五大要素骨架
+## 工作流从哪读起
 
-构建一个健壮的 Agent / 异步工作流服务，通常只需声明并实现以下 5 个部分：
+先读步骤 enum 和执行一步的 `match`。enum 表示某一步需要的输入，`match` 执行当前步骤并用返回值指明下一步。几个操作总是一起完成时，可以放在同一步内。需要独立保存进度、暂停或恢复时，再为它定义单独的步骤。
 
 ```mermaid
 flowchart LR
-    A[1. 步骤枚举 Step] --> B[2. 执行路由 execute_step]
-    B --> C[3. 检查点提交 commit_checkpoint]
-    D[4. 业务快照 Snapshot] -.-> B
-    E[5. 驱动与恢复 drive & resume] --> B
+    A["当前步骤"] --> B["执行本步的业务工作"]
+    B --> C["返回下一位置"]
+    C --> D["执行器确认提交"]
+    D -->|Ready| A
+    D -->|Paused| E["等外部输入"]
+    D -->|Completed| F["结束"]
 ```
 
-| 要素 | 职责 | 代码载体 |
-| :--- | :--- | :--- |
-| **1. 步骤枚举 (Step)** | 声明流程中的所有状态节点与转移携带的数据 | `enum MyStep` |
-| **2. 业务快照 (Snapshot)** | 存放业务全量上下文、输入、子任务结果与最终产物 | `struct MySnapshot` |
-| **3. 步骤执行 (step)** | 业务核心分发器：执行当前步骤，返回下一步位置 `Position<Step>` | `Workflow::step` 或 `execute_step` |
-| **4. 检查点提交 (commit)**| 在每一步流转确认后保存游标（内存/数据库/Redis），处理暂停状态 | `Workflow::commit` 或 `commit_checkpoint` |
-| **5. 生命周期驱动 (Service/drive)** | 异步 `spawn` 后台执行，封装 `create`、`drive`、`resume` 和 `cancel` | `MyService` |
+把步骤和业务分支放在一起，固定的下一步直接写在分支里。动态流程可以从业务状态或模型决策选择下一步，最终仍返回 `Ready`、`Paused` 或 `Completed`。运行入口负责加载状态、设置上限和调用执行器，检查点保存及用户恢复可以放在同一个文件的后部。
 
-> [!TIP]
-> **API 风格选择**：`pecs-graph` 支持两种编写风格：
-> 1. **Trait 契约风格（推荐）**：为业务服务实现 `pecs_graph::Workflow<Step>` trait，统一通过 `run_workflow` 驱动，契约清晰，易于 mock 测试与模块解耦。
-> 2. **闭包注入风格**：直接向 `run` 传入 `execute_step` 和 `commit_checkpoint` 闭包，简单轻量。两者在底层执行语义完全一致。
+| 需要什么 | 用哪个入口 |
+| --- | --- |
+| 进程内执行并返回结果 | `execute` 或 `execute_with_limits` |
+| 自定义检查点保存、暂停或取消 | `run`，直接传入步骤和提交回调 |
+| 同一个工作流对象提供步骤和提交方法 | 实现 `Workflow`，交给 `run_workflow` 执行 |
+| 通过运行 ID 加载并提交检查点 | 实现持久化 `Store`，调用 `run_stored` |
 
 ---
 
@@ -231,7 +229,7 @@ impl ReviewService {
 
 `pecs-graph` 支持两种驱动方式：
 
-#### 方式 A：实现 `Workflow` Trait 驱动（推荐）
+#### 方式 A：实现 `Workflow` Trait 驱动
 
 为业务服务实现 `Workflow<Step>`，将步骤执行与检查点提交统一聚合：
 
