@@ -1,8 +1,9 @@
-use std::{cell::RefCell, convert::Infallible, num::NonZeroUsize, time::Duration};
+use std::{cell::RefCell, convert::Infallible, future, num::NonZeroUsize, time::Duration};
 
 use pecs_graph::{
-    BatchError, CancellationToken, Checkpoint, MemoryStore, Position, RunLimits, RunOutcome, Step,
-    Store, StoreError, StoredRunError, execute, execute_with_limits, run_stored, run_stored_batch,
+    BatchError, CancellationToken, Checkpoint, MemoryStore, Position, RunError, RunLimits,
+    RunOutcome, Step, Store, StoreError, StoredRunError, execute, execute_with_limits, run,
+    run_stored, run_stored_batch,
 };
 
 fn limits() -> RunLimits {
@@ -114,6 +115,69 @@ async fn stale_runner_cannot_overwrite_a_committed_transition() {
             StoreError::Conflict
         )))
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn reload_skips_a_transition_whose_write_acknowledgement_was_lost() {
+    for cancel_write in [false, true] {
+        let store = MemoryStore::default();
+        let key = "run";
+        let cancel = CancellationToken::new();
+        let mut local = Checkpoint::new(0);
+        let revision = store.compare_and_put(&key, None, &local).await.unwrap();
+
+        let result = run(
+            &mut local,
+            limits(),
+            &cancel,
+            |state| {
+                assert_eq!(state, 0);
+                future::ready(Ok::<_, Infallible>(Position::Ready(1)))
+            },
+            async |next| {
+                store.compare_and_put(&key, Some(revision), &next).await?;
+                if cancel_write {
+                    cancel.cancel();
+                }
+                future::pending::<Result<(), StoreError<pecs_graph::MemoryStoreError>>>().await
+            },
+        )
+        .await;
+
+        if cancel_write {
+            assert!(matches!(result, Err(RunError::Cancelled)), "{result:?}");
+        } else {
+            assert!(matches!(result, Err(RunError::TimedOut)), "{result:?}");
+        }
+        assert_eq!(local, Checkpoint::new(0));
+        let saved = store.load(&key).await.unwrap().unwrap();
+        assert_eq!(saved.value.position(), &Position::Ready(1));
+        assert_eq!(saved.value.completed_steps(), 1);
+
+        let outcome = run_stored(
+            &store,
+            &key,
+            limits(),
+            &CancellationToken::new(),
+            async |state| {
+                assert_eq!(state, 1, "a stored transition must not execute again");
+                Ok::<_, Infallible>(Position::Completed)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            store
+                .load(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .value
+                .completed_steps(),
+            2
+        );
+    }
 }
 
 #[tokio::test]

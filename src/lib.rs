@@ -233,10 +233,7 @@ pub trait Workflow<S> {
     fn step(&self, state: S) -> impl Future<Output = Result<Position<S>, Self::Error>>;
 
     /// Acknowledge or persist a checkpoint before advancing. Defaults to a no-op.
-    fn commit(
-        &self,
-        _checkpoint: &Checkpoint<S>,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
+    fn commit(&self, _checkpoint: &Checkpoint<S>) -> impl Future<Output = Result<(), Self::Error>> {
         async { Ok(()) }
     }
 }
@@ -287,6 +284,11 @@ where
 /// Callers own atomicity, deduplication and recovery for external effects. If a
 /// commit is interrupted or its acknowledgement is lost, reload the checkpoint
 /// from the store before retrying.
+///
+/// If a write returns success before the executor observes cancellation or a
+/// deadline overrun, the checkpoint advances. The invocation still returns
+/// `Cancelled` or `TimedOut` once it observes that condition, even if the
+/// acknowledged transition paused or completed the workflow.
 ///
 /// # Parameters
 ///
@@ -363,10 +365,17 @@ where
     Writer: CheckpointWriter<S>,
 {
     let started = tokio::time::Instant::now();
-    // Defense-in-depth for timeouts and cooperative cancellation:
-    // 1. Synchronous deadline and cancel checks before & after `step` prevent committing
-    //    an expired transition or dispatching next work after time/token budget is exhausted.
-    // 2. The outer `tokio::select!` with `timeout` forces interruption if a step future hangs.
+    // The outer select can interrupt a pending future. Check at callback
+    // boundaries too, in case a callback finishes without yielding.
+    let check_interrupted = || {
+        if cancel.is_cancelled() {
+            return Err(RunError::Cancelled);
+        }
+        if started.elapsed() >= limits.timeout {
+            return Err(RunError::TimedOut);
+        }
+        Ok(())
+    };
     let execution = async {
         loop {
             let state = match &checkpoint.position {
@@ -379,19 +388,9 @@ where
             }
             // Give the executor a poll boundary even when both callbacks are ready.
             tokio::task::yield_now().await;
-            if cancel.is_cancelled() {
-                return Err(RunError::Cancelled);
-            }
-            if started.elapsed() >= limits.timeout {
-                return Err(RunError::TimedOut);
-            }
+            check_interrupted()?;
             let result = step(state.clone()).await;
-            if cancel.is_cancelled() {
-                return Err(RunError::Cancelled);
-            }
-            if started.elapsed() >= limits.timeout {
-                return Err(RunError::TimedOut);
-            }
+            check_interrupted()?;
             let (position, output) = result.map_err(RunError::Step)?;
             let next = Checkpoint {
                 position,
@@ -399,6 +398,7 @@ where
             };
             writer.write(&next).await.map_err(RunError::Commit)?;
             *checkpoint = next;
+            check_interrupted()?;
             if output.is_some() {
                 return Ok((RunOutcome::Completed, output));
             }

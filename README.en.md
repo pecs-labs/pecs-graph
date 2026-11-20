@@ -117,5 +117,11 @@ async fn main() {
 - `MemoryStore` supports tests and in-process resume. Implement a durable
   `Store` for cross-process recovery. Conditional writes protect revisions,
   and applications coordinate ownership when scheduling across workers.
+- Cancellation or a timeout can occur during a write. An acknowledged write
+  advances the checkpoint even when the invocation returns an interruption.
+  If the acknowledgement is missing, reload from storage before retrying.
+
+Run `cargo run -p pecs-graph --example stored_approval` to try the
+[approval example](examples/stored_approval.rs) with revision-checked resume.
 
 Run `cargo test` to exercise the executor independently.

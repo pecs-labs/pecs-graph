@@ -39,13 +39,11 @@ flowchart LR
 
 ```rust
 use pecs_graph::{
-    Checkpoint, Position, RunLimits, RunOutcome, Workflow,
-    run, run_batch, run_workflow,
+    CancellationToken, Checkpoint, Position, RunLimits, RunOutcome, Workflow, run, run_batch,
 };
 use serde::{Deserialize, Serialize};
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
-use tokio::sync::{Mutex, Semaphore};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::Mutex;
 
 // 1. 显式步骤枚举：携带下一步需要的数据
 // 建议 derive Clone, Debug, PartialEq 以及 Serialize, Deserialize（便于持久化和日志）
@@ -63,7 +61,7 @@ pub enum ReviewStep {
     Synthesize,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReviewTask {
     pub task_id: String,
     pub dimension: String, // e.g. "security", "performance", "style"
@@ -94,9 +92,8 @@ pub struct ReviewSnapshot {
 
 ```rust
 pub struct ReviewService {
-    // 内存存储或 DB Repository
+    // 示例中的单个运行
     pub state: Arc<Mutex<ReviewState>>,
-    pub permits: Arc<Semaphore>,
 }
 
 pub struct ReviewState {
@@ -138,18 +135,23 @@ impl ReviewService {
 
             ReviewStep::Inspect(tasks) => {
                 println!("[{id}] 步骤 3: 并行执行子审查任务，批次大小: {}", tasks.len());
-                let concurrency = NonZeroUsize::new(tasks.len()).unwrap_or(NonZeroUsize::MIN);
+                let concurrency = NonZeroUsize::new(4).unwrap();
                 
                 // 使用 run_batch 实现有界并发与异常快速中断
                 run_batch(&tasks, concurrency, |task| async move {
                     // 调用各个细分 Agent / LLM
-                    let output = format!("{} 维度检查通过，无明显缺陷", task.dimension);
+                    let output = if task.task_id == "sec" {
+                        "发现疑似密钥硬编码".into()
+                    } else {
+                        format!("{} 维度检查通过，无明显缺陷", task.dimension)
+                    };
                     self.save_task_result(id, &task.task_id, output).await;
                     Ok::<_, MyError>(())
                 }).await?;
 
                 // 检查是否命中高危条件需要人工介入
-                let has_high_risk = false; // 示例业务判断
+                let has_high_risk = self.state.lock().await.snapshot.task_results.iter()
+                    .any(|(_, result)| result == "发现疑似密钥硬编码");
                 if has_high_risk {
                     Ok(Position::Paused(ReviewStep::AwaitApproval {
                         high_risks: vec!["发现疑似密钥硬编码".into()],
@@ -181,7 +183,6 @@ impl ReviewService {
 
     async fn finalize_report(&self, _id: &str) -> Result<(), MyError> {
         let mut s = self.state.lock().await;
-        s.snapshot.status = "completed".into();
         s.snapshot.final_report = Some("代码质量评估：良好。".into());
         s.snapshot.version += 1;
         Ok(())
@@ -193,7 +194,7 @@ impl ReviewService {
 
 ### 3. 实现检查点提交 (`commit_checkpoint`)
 
-执行器每次计算出下一个 `Position` 后，在执行下一步之前必须完成提交，保证故障恢复与状态一致：
+执行器完成提交后才启动下一步。这个内存示例在同一把锁内更新检查点和对外状态。步骤执行期间保存的任务结果如需跨进程恢复，还要有独立的持久化和去重策略。
 
 ```rust
 impl ReviewService {
@@ -208,13 +209,17 @@ impl ReviewService {
         }
 
         // 处理暂停点状态（Human-in-the-loop）
-        if let Position::Paused(ReviewStep::AwaitApproval { high_risks }) = checkpoint.position() {
-            s.snapshot.status = "awaiting_approval".into();
-            println!("[{id}] 流程暂停等待人工介入: {high_risks:?}");
+        match checkpoint.position() {
+            Position::Paused(ReviewStep::AwaitApproval { high_risks }) => {
+                s.snapshot.status = "awaiting_approval".into();
+                println!("[{id}] 流程暂停等待人工介入: {high_risks:?}");
+            }
+            Position::Completed => s.snapshot.status = "completed".into(),
+            _ => {}
         }
 
         s.checkpoint = checkpoint;
-        // 如果是持久化存储，在此处执行 db.update_run(...)
+        s.snapshot.version += 1;
         Ok(())
     }
 }
@@ -248,7 +253,7 @@ impl Workflow<ReviewStep> for ReviewService {
 
 ```rust
 // 使用 run_workflow 驱动
-let outcome = run_workflow(&mut checkpoint, limits, &cancel, self).await;
+let outcome = pecs_graph::run_workflow(&mut checkpoint, limits, &cancel, self).await;
 ```
 
 #### 方式 B：闭包组合驱动
@@ -281,20 +286,34 @@ impl ReviewService {
         match outcome {
             Ok(RunOutcome::Completed) => println!("[{id}] 工作流执行完毕"),
             Ok(RunOutcome::Paused) => println!("[{id}] 工作流已安全暂停"),
-            Err(e) => eprintln!("[{id}] 工作流异常退出: {e:?}"),
+            Err(pecs_graph::RunError::Cancelled) => return Err(MyError::Cancelled),
+            Err(pecs_graph::RunError::Step(err) | pecs_graph::RunError::Commit(err)) => {
+                return Err(err);
+            }
+            Err(err) => return Err(MyError::ExecutionFailed(format!("{err:?}"))),
         }
         Ok(())
     }
 
     /// 用户确认接口（Human-in-the-loop 唤醒）
-    pub async fn approve_and_resume(self: &Arc<Self>, id: &str) -> Result<(), MyError> {
+    pub async fn approve_and_resume(
+        self: &Arc<Self>,
+        id: &str,
+        expected_version: u64,
+    ) -> Result<(), MyError> {
         {
             let mut s = self.state.lock().await;
-            if s.snapshot.status != "awaiting_approval" {
+            if s.snapshot.version != expected_version
+                || !matches!(
+                    s.checkpoint.position(),
+                    Position::Paused(ReviewStep::AwaitApproval { .. })
+                )
+            {
                 return Err(MyError::InvalidState);
             }
             s.snapshot.approved_by_user = true;
             s.snapshot.status = "running".into();
+            s.snapshot.version += 1;
             // 关键：将 Paused 游标转为 Ready
             s.checkpoint = s.checkpoint.clone().resume();
         }
@@ -303,7 +322,9 @@ impl ReviewService {
         let svc = self.clone();
         let run_id = id.to_string();
         tokio::spawn(async move {
-            let _ = svc.drive(&run_id).await;
+            if let Err(err) = svc.drive(&run_id).await {
+                eprintln!("[{run_id}] 工作流异常退出: {err:?}");
+            }
         });
 
         Ok(())
@@ -329,14 +350,23 @@ pub enum MyError {
 - 结合 `pecs_graph::RunLimits { max_steps, .. }`，框架层能保证不会出现死循环。
 
 ### 2. 外部持久化升级（跨进程 / 分布式恢复）
-当前示例使用进程内内存保存检查点。若业务需要支持服务重启或横向扩展部署：
-- 实现 `pecs_graph::Store` trait（提供 `get`, `put`, `compare_and_put`）；
-- 使用 `pecs_graph::run_stored` 代替 `run`；
-- 每次步骤提交将自动携带乐观锁版本号，天然支持分布式 Worker 竞争与抢占安全。
+
+1. 用持久化后端实现 `Store::load` 和 `Store::compare_and_put`。后者须原子地比较版本并写入。用 `compare_and_put(key, None, &Checkpoint::new(initial))` 创建初始检查点。
+2. 按固定的运行标识调用 `run_stored`。每次调用都从存储加载最新检查点，使用当前版本提交每一个新位置。
+3. 需要人工输入时，让步骤返回 `Position::Paused(next)`，并将暂停记录的 revision 随输入请求一起提供给调用方。收到回复后加载最新检查点，确认它仍处于暂停且版本与请求一致。用 `resume_with` 合入经业务校验的输入，再用该版本提交。收到 `StoreError::Conflict` 时重新读取状态，让调用方确认最新请求。
+
+运行 `cargo run -p pecs-graph --example stored_approval` 可以体验[人工审批示例](examples/stored_approval.rs)。它使用 `MemoryStore` 演示暂停、附带版本提交回复、拒绝过期回复和续跑。
+
+版本比较发生在提交时。两个 worker 可以同时读到同一版本，各自执行一步，随后其中一个写入失败。需要同一运行只有一个活跃执行者时，由调度层协调运行权。如果步骤可能重做，用可从持久化状态重建的幂等键调用支持去重的外部服务。确认丢失时，先查询已保存的检查点和外部操作结果，再决定是否重试。
 
 ### 3. 取消与快速熔断
-- 永远将 `CancellationToken` 传递给所有的子 I/O（如 HTTP 模型请求、外部工具调用）；
-- `pecs-graph` 在每一步流转前后都会检查 token，并在取消时直接返回 `RunError::Cancelled`，清理挂起的并发 Future。
+
+检查点写入也计入本次执行的时间预算。执行器在步骤和写入之间检查取消与超时，并可停止等待挂起的 future。需要在子任务里结束工作时，将取消信号传给子任务。已经发给外部服务的请求仍可能完成。
+
+| 写入结果 | 本地检查点 | 恢复方式 |
+| --- | --- | --- |
+| 写入已确认，随后检测到超时或取消 | 保留新位置，包括暂停和完成 | 从该位置恢复。持久化执行可以重新加载该位置 |
+| 等待确认时超时、取消或后端返回错误 | 保留上一次确认的位置 | 持久化后端可能已经提交。重试前从后端重新加载 |
 
 ### 4. 动态规划与执行循环（Plan-Execute Loop）
 在智能体决策工作流中（如 Roundtable 智囊团），步骤往往不是线性的，而是由规划模型动态主导：
@@ -357,7 +387,7 @@ pub enum MyError {
 | **适用场景** | 内存快照型工作流、短时任务、结果合并写回 Snapshot | 跨进程/分布式任务、长时外部调用、强断点续跑 |
 | **持久化粒度** | 外部统一在 Step/Snapshot 层面持久化 | 每个 Task 根据 `TaskKey(run_id, batch_id, task_id)` 独立持久化 |
 | **幂等机制** | 外部业务层管理幂等过滤 | 框架自动查询 Store，已完成任务跳过执行直接重用结果 |
-| **重试代价** | 若单步失败重试，需由业务代码过滤已完成项 | 传入相同的 `run_id` 和 `batch_id` 即可零浪费增量重跑 |
+| **重试行为** | 由调用方读取已保存结果并筛出待执行项 | 重试使用相同的运行、批次和任务 ID 及输入。只复用已保存的结果，未保存结果的任务可能重做 |
 
 ### 7. 检查点写入与副作用分离
 `CheckpointWriter::write` 或 `commit_checkpoint` 的首要职责是保证游标原子提交：

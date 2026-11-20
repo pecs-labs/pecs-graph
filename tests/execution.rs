@@ -142,6 +142,58 @@ async fn elapsed_deadline_blocks_commit_after_a_blocking_step() {
     assert_eq!(checkpoint.completed_steps(), 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn late_write_reports_timeout_but_keeps_the_acknowledged_position() {
+    for position in [Position::Ready(1), Position::Paused(1), Position::Completed] {
+        let mut checkpoint = Checkpoint::new(0);
+        let limits = limits(1);
+        let result = pecs_graph::run(
+            &mut checkpoint,
+            limits,
+            &CancellationToken::new(),
+            |state| {
+                assert_eq!(state, 0);
+                future::ready(Ok::<_, Infallible>(position.clone()))
+            },
+            |_| async {
+                tokio::time::advance(limits.timeout).await;
+                Ok::<_, Infallible>(())
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(RunError::TimedOut)), "{result:?}");
+        assert_eq!(checkpoint.position(), &position);
+        assert_eq!(checkpoint.completed_steps(), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancellation_during_an_acknowledged_write_preserves_the_transition() {
+    for position in [Position::Ready(1), Position::Paused(1), Position::Completed] {
+        let mut checkpoint = Checkpoint::new(0);
+        let cancel = CancellationToken::new();
+        let result = pecs_graph::run(
+            &mut checkpoint,
+            limits(1),
+            &cancel,
+            |state| {
+                assert_eq!(state, 0);
+                future::ready(Ok::<_, Infallible>(position.clone()))
+            },
+            |_| {
+                cancel.cancel();
+                future::ready(Ok::<_, Infallible>(()))
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(RunError::Cancelled)), "{result:?}");
+        assert_eq!(checkpoint.position(), &position);
+        assert_eq!(checkpoint.completed_steps(), 1);
+    }
+}
+
 #[tokio::test]
 async fn ready_batch_yields_to_workflow_cancellation() {
     tokio::spawn(async {

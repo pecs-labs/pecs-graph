@@ -94,5 +94,6 @@ async fn main() {
 - 用 `Store::compare_and_put` 和预期版本 `None` 创建初始检查点，再按运行 ID 调用 `run_stored`。每个步骤都会按当前版本提交。步骤返回 `Position::Paused(next)` 后，可加载检查点，通过 `resume_with` 合入输入，再按加载到的版本提交。续跑保留累计步骤数。
 - `run_stored_batch` 通过运行 ID、批次 ID 和任务 ID 保存每项结果。重试时传入相同 ID，已提交的任务会直接返回保存的结果。并发工作可能在保存前中断，外部操作应支持幂等。
 - `MemoryStore` 适用于测试和进程内恢复。跨进程恢复需要应用实现持久化 `Store`。版本校验保护提交，多 worker 调度仍需由应用协调执行权。
+- 取消或超时可能发生在写入期间。已确认的提交会推进检查点，即使本次调用返回了取消或超时。写入确认缺失时，先从存储重新加载，再决定如何恢复。
 
-运行 `cargo test` 可独立验证执行器。
+运行 `cargo run -p pecs-graph --example stored_approval` 可以体验带版本检查的[人工审批示例](examples/stored_approval.rs)。运行 `cargo test -p pecs-graph` 可验证执行器。

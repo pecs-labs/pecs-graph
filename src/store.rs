@@ -42,6 +42,8 @@ pub trait Store<K, V>: Send + Sync {
 
     /// Atomically save if the current revision matches. Use `None` to create a
     /// record only if the key is absent. Return the new revision on success.
+    /// If the future is dropped or the backend cannot acknowledge the write,
+    /// the value may already have been stored. Reload before retrying.
     fn compare_and_put(
         &self,
         key: &K,
@@ -141,6 +143,8 @@ pub enum StoredRunError<E, C> {
 /// `store` must already contain the initial checkpoint at `key`.
 /// `limits.timeout` covers the initial read, step execution, and commits.
 /// `cancel` and `step` have the same semantics as in [`crate::run`].
+/// Each invocation reloads the stored checkpoint. If a write could not be
+/// acknowledged, inspect the stored state before invoking external effects again.
 /// A paused checkpoint returns its current outcome until you save a resumed
 /// checkpoint against its current revision.
 pub async fn run_stored<K, S, E, D, Work>(
@@ -260,9 +264,10 @@ pub enum BatchError<E, C> {
 
 /// Run a finite batch and commit each output independently.
 ///
-/// Results are returned in input order. Reuse the same IDs for a retry, and a
-/// new batch ID for different inputs. Use idempotent task effects because a
-/// task can finish its work before its result is committed.
+/// Results are returned in input order. Reuse the same IDs and inputs for a
+/// retry. Use a new batch ID for a new invocation or different inputs.
+/// A task without a saved result can run again after interruption or on a
+/// concurrent worker. Use idempotent task effects or coordinate execution.
 ///
 /// `store` reads and writes results keyed by `run_id`, `batch_id`, and the item
 /// ID from `items`. The finite input is collected and task IDs are validated
