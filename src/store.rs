@@ -10,6 +10,7 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 
 use crate::{
     CancellationToken, Checkpoint, CheckpointWriter, Position, RunError, RunLimits, RunOutcome,
+    Workflow,
 };
 
 /// A stored value and the revision to use for its next conditional write.
@@ -196,6 +197,25 @@ where
     )
     .await?;
     Ok(outcome)
+}
+
+/// Run an existing stored checkpoint using a [`Workflow`] implementation.
+///
+/// Checkpoint persistence is handled by `store` via [`run_stored`]; [`Workflow::commit`]
+/// is not invoked.
+pub async fn run_stored_workflow<K, S, W, D>(
+    store: &D,
+    key: &K,
+    limits: RunLimits,
+    cancel: &CancellationToken,
+    workflow: &W,
+) -> Result<RunOutcome, StoredRunError<W::Error, D::Error>>
+where
+    S: Clone,
+    W: Workflow<S>,
+    D: Store<K, Checkpoint<S>>,
+{
+    run_stored(store, key, limits, cancel, |state| workflow.step(state)).await
 }
 
 struct StoreWriter<'a, D, K> {

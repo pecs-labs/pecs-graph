@@ -236,3 +236,48 @@ async fn batch_rejects_duplicate_ids_before_starting_any_work() {
     .await;
     assert!(matches!(result, Err(BatchError::DuplicateTask(id)) if id == "same"));
 }
+
+#[tokio::test]
+async fn run_stored_workflow_drives_workflow_against_store() {
+    struct Stepper;
+
+    impl pecs_graph::Workflow<u8> for Stepper {
+        type Error = Infallible;
+
+        async fn step(&self, state: u8) -> Result<Position<u8>, Self::Error> {
+            Ok(match state {
+                0 => Position::Paused(1),
+                1 => Position::Completed,
+                other => Position::Ready(other),
+            })
+        }
+    }
+
+    let store = MemoryStore::default();
+    let key = "stored-wf";
+    let cancel = CancellationToken::new();
+    let workflow = Stepper;
+
+    store
+        .compare_and_put(&key, None, &Checkpoint::new(0u8))
+        .await
+        .unwrap();
+
+    let paused = pecs_graph::run_stored_workflow(&store, &key, limits(), &cancel, &workflow)
+        .await
+        .unwrap();
+    assert_eq!(paused, RunOutcome::Paused);
+
+    let saved = store.load(&key).await.unwrap().unwrap();
+    store
+        .compare_and_put(&key, Some(saved.revision), &saved.value.resume())
+        .await
+        .unwrap();
+
+    let completed = pecs_graph::run_stored_workflow(&store, &key, limits(), &cancel, &workflow)
+        .await
+        .unwrap();
+    assert_eq!(completed, RunOutcome::Completed);
+    let final_saved = store.load(&key).await.unwrap().unwrap();
+    assert_eq!(final_saved.value.completed_steps(), 2);
+}

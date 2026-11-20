@@ -282,7 +282,7 @@ async fn a_reloaded_batch_only_executes_uncommitted_items() {
 }
 
 struct TestWorkflow {
-    commits: RefCell<Vec<Position<u32>>>,
+    commits: std::sync::Mutex<Vec<Position<u32>>>,
 }
 
 impl pecs_graph::Workflow<u32> for TestWorkflow {
@@ -297,7 +297,10 @@ impl pecs_graph::Workflow<u32> for TestWorkflow {
     }
 
     async fn commit(&self, checkpoint: &Checkpoint<u32>) -> Result<(), Self::Error> {
-        self.commits.borrow_mut().push(checkpoint.position().clone());
+        self.commits
+            .lock()
+            .unwrap()
+            .push(checkpoint.position().clone());
         Ok(())
     }
 }
@@ -305,24 +308,19 @@ impl pecs_graph::Workflow<u32> for TestWorkflow {
 #[tokio::test]
 async fn run_workflow_drives_trait_implementation() {
     let workflow = TestWorkflow {
-        commits: RefCell::new(Vec::new()),
+        commits: std::sync::Mutex::new(Vec::new()),
     };
     let mut checkpoint = Checkpoint::new(0u32);
     let cancel = CancellationToken::new();
 
-    let outcome = pecs_graph::run_workflow(
-        &mut checkpoint,
-        limits(5),
-        &cancel,
-        &workflow,
-    )
-    .await
-    .unwrap();
+    let outcome = pecs_graph::run_workflow(&mut checkpoint, limits(5), &cancel, &workflow)
+        .await
+        .unwrap();
 
     assert_eq!(outcome, RunOutcome::Completed);
     assert_eq!(checkpoint.completed_steps(), 4);
     assert_eq!(
-        *workflow.commits.borrow(),
+        *workflow.commits.lock().unwrap(),
         vec![
             Position::Ready(1),
             Position::Ready(2),
@@ -330,4 +328,35 @@ async fn run_workflow_drives_trait_implementation() {
             Position::Completed,
         ]
     );
+}
+
+#[tokio::test]
+async fn generic_workflow_can_be_driven_inside_tokio_spawn() {
+    async fn spawn_generic<S, W>(
+        workflow: std::sync::Arc<W>,
+        initial: S,
+    ) -> Result<(RunOutcome, usize), RunError<W::Error, W::Error>>
+    where
+        S: Clone + Send + Sync + 'static,
+        W: pecs_graph::Workflow<S> + 'static,
+        W::Error: Send + 'static,
+    {
+        tokio::spawn(async move {
+            let mut checkpoint = Checkpoint::new(initial);
+            let cancel = CancellationToken::new();
+            let outcome =
+                pecs_graph::run_workflow(&mut checkpoint, limits(5), &cancel, &*workflow).await?;
+            Ok((outcome, checkpoint.completed_steps()))
+        })
+        .await
+        .unwrap()
+    }
+
+    let workflow = std::sync::Arc::new(TestWorkflow {
+        commits: std::sync::Mutex::new(Vec::new()),
+    });
+    let (outcome, steps) = spawn_generic(workflow.clone(), 0u32).await.unwrap();
+    assert_eq!(outcome, RunOutcome::Completed);
+    assert_eq!(steps, 4);
+    assert_eq!(workflow.commits.lock().unwrap().len(), 4);
 }

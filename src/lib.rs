@@ -9,7 +9,7 @@ pub use tokio_util::sync::CancellationToken;
 mod store;
 pub use store::{
     BatchError, MemoryStore, MemoryStoreError, Store, StoreError, Stored, StoredRunError, TaskKey,
-    run_stored, run_stored_batch,
+    run_stored, run_stored_batch, run_stored_workflow,
 };
 
 /// The next action available from a checkpoint.
@@ -225,15 +225,18 @@ pub enum RunError<E, C> {
 pub type SimpleRunError<E> = RunError<E, Infallible>;
 
 /// A workflow definition whose steps and checkpoint commits can be driven by [`run_workflow`].
-pub trait Workflow<S> {
+pub trait Workflow<S>: Send + Sync {
     /// Failure returned by step execution or checkpoint commit.
     type Error;
 
     /// Execute the current step and return the next position.
-    fn step(&self, state: S) -> impl Future<Output = Result<Position<S>, Self::Error>>;
+    fn step(&self, state: S) -> impl Future<Output = Result<Position<S>, Self::Error>> + Send;
 
     /// Acknowledge or persist a checkpoint before advancing. Defaults to a no-op.
-    fn commit(&self, _checkpoint: &Checkpoint<S>) -> impl Future<Output = Result<(), Self::Error>> {
+    fn commit(
+        &self,
+        _checkpoint: &Checkpoint<S>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async { Ok(()) }
     }
 }
